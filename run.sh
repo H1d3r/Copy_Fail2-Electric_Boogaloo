@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # copyfail2 — adds a passwordless uid-0 user "sick" to /etc/passwd and
 # drops you into its shell. No SUID helper, no auto-restore.
 #

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # IPv6 dual of run.sh. Same flow, esp6 over ::1.
 #
 # Usage:
